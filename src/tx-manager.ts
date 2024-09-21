@@ -4,7 +4,9 @@ import {
   setupAdapter,
   signatureFromOutcome,
   SignRequestData,
+  NearEthTxData,
   EthSignParams,
+  RecoveryData,
   toPayload,
   PersonalSignParams,
 } from "near-ca";
@@ -13,13 +15,8 @@ import { Address, Hash, Hex, serializeSignature } from "viem";
 import { Erc4337Bundler } from "./lib/bundler";
 import { encodeMulti } from "./lib/multisend";
 import { ContractSuite } from "./lib/safe";
-import { decodeSafeMessage } from "./lib/safe-message";
-import {
-  EncodedTxData,
-  MetaTransaction,
-  UserOperation,
-  UserOperationReceipt,
-} from "./types";
+import { decodeSafeMessage, safeMessageTxData } from "./lib/safe-message";
+import { MetaTransaction, UserOperation, UserOperationReceipt } from "./types";
 import {
   getClient,
   isContract,
@@ -157,22 +154,15 @@ export class TransactionManager {
   async encodeSignRequest(
     signRequest: SignRequestData,
     usePaymaster: boolean
-  ): Promise<EncodedTxData> {
-    const { payload, evmMessage, hash } = await this.requestRouter(
-      signRequest,
-      usePaymaster
-    );
+  ): Promise<NearEthTxData> {
+    const data = await this.requestRouter(signRequest, usePaymaster);
     return {
       nearPayload: await this.nearAdapter.mpcContract.encodeSignatureRequestTx({
         path: this.nearAdapter.derivationPath,
-        payload,
+        payload: data.payload,
         key_version: 0,
       }),
-      evmData: {
-        chainId: signRequest.chainId,
-        data: evmMessage,
-        hash,
-      },
+      ...data,
     };
   }
 
@@ -267,7 +257,8 @@ export class TransactionManager {
   ): Promise<{
     evmMessage: string;
     payload: number[];
-    hash: Hash;
+    // We may eventually be able to abolish this.
+    recoveryData: RecoveryData;
   }> {
     const safeInfo = {
       address: { value: this.address },
@@ -281,22 +272,20 @@ export class TransactionManager {
       case "eth_signTypedData":
       case "eth_signTypedData_v4":
       case "eth_sign": {
-        const [_, messageOrData] = params as EthSignParams;
-        const message = decodeSafeMessage(messageOrData, safeInfo);
-        return {
-          evmMessage: message.safeMessageMessage,
-          payload: toPayload(message.safeMessageHash),
-          hash: message.safeMessageHash,
-        };
+        const [sender, messageOrData] = params as EthSignParams;
+        return safeMessageTxData(
+          method,
+          decodeSafeMessage(messageOrData, safeInfo),
+          sender
+        );
       }
       case "personal_sign": {
-        const [messageHash, _] = params as PersonalSignParams;
-        const message = decodeSafeMessage(messageHash, safeInfo);
-        return {
-          evmMessage: message.safeMessageMessage,
-          payload: toPayload(message.safeMessageHash),
-          hash: message.safeMessageHash,
-        };
+        const [messageHash, sender] = params as PersonalSignParams;
+        return safeMessageTxData(
+          method,
+          decodeSafeMessage(messageHash, safeInfo),
+          sender
+        );
       }
       case "eth_sendTransaction": {
         const transactions = metaTransactionsFromRequest(params);
@@ -309,7 +298,12 @@ export class TransactionManager {
         return {
           payload: toPayload(opHash),
           evmMessage: JSON.stringify(userOp),
-          hash: await this.opHash(userOp),
+          recoveryData: {
+            type: method,
+            // TODO: Double check that this is sufficient for UI.
+            // We may want to adapt and return the `MetaTransactions` instead.
+            data: opHash,
+          },
         };
       }
     }
